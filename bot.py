@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
+from threading import Lock
 from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
@@ -36,6 +38,81 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+DB_PATH = os.getenv("DB_PATH", "user_requests.sqlite3")
+
+
+def init_db(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            idea_name TEXT,
+            payload TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+DB_CONN = init_db(DB_PATH)
+DB_LOCK = Lock()
+
+
+def _save_user_request(user_id: str, responses: Dict[str, str]) -> None:
+    if not user_id or not responses:
+        return
+    idea_name = (responses.get("idea_name") or "").strip() or None
+    payload = json.dumps(responses, ensure_ascii=False)
+    with DB_LOCK:
+        DB_CONN.execute(
+            "INSERT INTO user_requests (user_id, idea_name, payload) VALUES (?, ?, ?)",
+            (user_id, idea_name, payload),
+        )
+        DB_CONN.commit()
+
+
+def _fetch_user_requests(user_id: str) -> List[Dict[str, Any]]:
+    if not user_id:
+        return []
+    with DB_LOCK:
+        rows = DB_CONN.execute(
+            """
+            SELECT id, created_at, idea_name, payload
+            FROM user_requests
+            WHERE user_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    entries: List[Dict[str, Any]] = []
+    for row in rows:
+        payload_raw = row[3]
+        try:
+            responses = json.loads(payload_raw) if payload_raw else {}
+        except json.JSONDecodeError:
+            responses = {}
+        entries.append(
+            {
+                "id": row[0],
+                "created_at": row[1],
+                "idea_name": row[2] or responses.get("idea_name") or "Не указано",
+                "responses": responses,
+            }
+        )
+    return entries
+
+
+async def store_user_request(user_id: str, responses: Dict[str, str]) -> None:
+    await asyncio.to_thread(_save_user_request, user_id, dict(responses))
+
+
+async def get_user_requests(user_id: str) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(_fetch_user_requests, user_id)
 
 QUESTION_FLOW: List[Tuple[str, str]] = [
     ("idea_name", "Как называется ваш стартап?"),
@@ -205,6 +282,12 @@ async def collect_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     next_state = state + 1
     if next_state >= len(QUESTION_FLOW):
+        user = update.effective_user
+        if user:
+            try:
+                await store_user_request(str(user.id), responses)
+            except Exception as err:  # noqa: BLE001 - logging for diagnostics
+                logger.exception("Failed to record request for user %s: %s", user.id, err)
         await update.message.reply_text("Спасибо! Анализирую идею, это может занять несколько секунд...")
         try:
             feedback = await generate_feedback(responses)
@@ -223,8 +306,33 @@ async def collect_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Используйте /start, чтобы начать новый опрос, или /cancel для завершения текущего диалога."
+        "Используйте /start, чтобы начать новый опрос, /history — чтобы посмотреть прошлые запросы, "
+        "или /cancel для завершения текущего диалога."
     )
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    message = update.message
+    if not user or not message:
+        return
+
+    requests = await get_user_requests(str(user.id))
+    if not requests:
+        await message.reply_text("История запросов пуста. Отправьте /start, чтобы начать.")
+        return
+
+    lines = ["Ваши предыдущие запросы:"]
+    max_entries = 10
+    for idx, entry in enumerate(requests[:max_entries], start=1):
+        idea_name = entry.get("idea_name", "Не указано")
+        created_at = entry.get("created_at", "")
+        lines.append(f"{idx}. {created_at} — {idea_name}")
+
+    if len(requests) > max_entries:
+        lines.append(f"Показаны последние {max_entries} из {len(requests)} записей.")
+
+    await message.reply_text("\n".join(lines))
 
 
 def main() -> None:
@@ -242,6 +350,7 @@ def main() -> None:
 
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("history", history_command))
 
     logger.info("Bot is starting...")
     application.run_polling()
